@@ -1,0 +1,3 @@
+/home/avadik/Programming/Git/Lab2/build/CMakeFiles/test_blas.dir
+/home/avadik/Programming/Git/Lab2/build/CMakeFiles/edit_cache.dir
+/home/avadik/Programming/Git/Lab2/build/CMakeFiles/rebuild_cache.dir

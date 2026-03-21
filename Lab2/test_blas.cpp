@@ -1,285 +1,313 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "cblas.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 using namespace std;
+using Clock = chrono::steady_clock;
 
-#define RESET "\033[0m"
-#define GREEN "\033[32m"
-#define RED "\033[31m"
-#define YELLOW "\033[33m"
-#define CYAN "\033[36m"
-
-struct TestSuite {
-    int passed = 0;
-    int total = 0;
-
-    void report(bool (*test_func)(), const string& name) {
-        total++;
-        try {
-            if (test_func()) {
-                passed++;
-                cout << GREEN << "  [OK]   " << RESET << name << '\n';
-            } else {
-                cout << RED << "  [FAIL] " << RESET << name
-                     << " (Неверный результат вычислений)\n";
-            }
-        } catch (const exception& e) {
-            cout << RED << "  [FAIL] " << RESET << name
-                 << " (Критическая ошибка: " << e.what() << ")\n";
-        } catch (...) {
-            cout << RED << "  [FAIL] " << RESET << name
-                 << " (Неизвестный сбой в коде)\n";
-        }
-    }
-
-    void summary() const {
-        cout << '\n' << CYAN << "=== ИТОГИ ТЕСТИРОВАНИЯ ===" << RESET << '\n';
-        cout << "Всего тестов: " << total << '\n';
-        cout << "Успешно:      " << GREEN << passed << RESET << '\n';
-        if (passed < total) {
-            cout << "Ошибок:       " << RED << total - passed << RESET << '\n';
-        }
-    }
-};
-
-struct BenchmarkResult {
-    string name;
-    double manual_ms;
-    double openblas_ms;
-    double performance_pct; 
-};
+namespace myblas {
 
 template <typename T>
-bool almost_equal(T lhs, T rhs, T eps) {
-    return fabs(lhs - rhs) <= eps;
-}
-
-bool test_axpy() {
-    float x[2] = {1.0f, 2.0f};
-    float y[2] = {3.0f, 4.0f};
-    cblas_saxpy(2, 2.0f, x, 1, y, 1);
-    return y[0] == 5.0f && y[1] == 8.0f;
-}
-
-bool test_scal() {
-    double x[2] = {10.0, 20.0};
-    cblas_dscal(2, 0.5, x, 1);
-    return x[0] == 5.0 && x[1] == 10.0;
-}
-
-bool test_copy_swap() {
-    float x[2] = {1.0f, 2.0f};
-    float y[2] = {0.0f, 0.0f};
-    cblas_scopy(2, x, 1, y, 1);
-    float a = 5.0f;
-    float b = 10.0f;
-    cblas_sswap(1, &a, 1, &b, 1);
-    return y[0] == 1.0f && a == 10.0f && b == 5.0f;
-}
-
-bool test_dot() {
-    double x[2] = {1.0, 2.0};
-    double y[2] = {3.0, 4.0};
-    double res = cblas_ddot(2, x, 1, y, 1);
-    return res == 11.0;
-}
-
-bool test_norms() {
-    float x[3] = {3.0f, -4.0f, 0.0f};
-    float n2 = cblas_snrm2(3, x, 1);
-    float a1 = cblas_sasum(3, x, 1);
-    return almost_equal(n2, 5.0f, 1e-5f) &&
-           almost_equal(a1, 7.0f, 1e-5f);
-}
-
-bool test_iamax() {
-    double x[4] = {1.0, -10.0, 5.0, 2.0};
-    size_t idx = cblas_idamax(4, x, 1);
-    return idx == 1;
-}
-
-bool test_rotations() {
-    float a = 1.0f;
-    float b = 1.0f;
-    float c = 0.0f;
-    float s = 0.0f;
-    cblas_srotg(&a, &b, &c, &s);
-
-    float x[2] = {1.0f, 0.0f};
-    float y[2] = {0.0f, 1.0f};
-    cblas_srot(2, x, 1, y, 1, c, s);
-
-    return isfinite(c) && isfinite(s) &&
-           isfinite(x[0]) && isfinite(y[0]);
-}
-
-bool test_rotm() {
-    double d1 = 1.0;
-    double d2 = 1.0;
-    double b1 = 1.0;
-    double b2 = 1.0;
-    double param[5] = {};
-    cblas_drotmg(&d1, &d2, &b1, b2, param);
-
-    double vx[2] = {1.0, 2.0};
-    double vy[2] = {3.0, 4.0};
-    cblas_drotm(2, vx, 1, vy, 1, param);
-
-    return isfinite(vx[0]) && isfinite(vx[1]) &&
-           isfinite(vy[0]) && isfinite(vy[1]);
-}
-
-void manual_saxpy(int n, float alpha, const float* x, float* y) {
-    for (int i = 0; i < n; ++i) {
-        y[i] += alpha * x[i];
+void gemm_seq(int m, int n, int k, T alpha, const T* a, const T* b, T beta, T* c) {
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+            T sum = T(0);
+            for (int p = 0; p < k; ++p) {
+                sum += a[i * k + p] * b[p * n + j];
+            }
+            c[i * n + j] = alpha * sum + beta * c[i * n + j];
+        }
     }
 }
 
-void manual_dscal(int n, double alpha, double* x) {
-    for (int i = 0; i < n; ++i) {
-        x[i] *= alpha;
+template <typename T>
+void gemm_par(int m, int n, int k, T alpha, const T* a, const T* b, T beta, T* c) {
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+            T sum = T(0);
+            for (int p = 0; p < k; ++p) {
+                sum += a[i * k + p] * b[p * n + j];
+            }
+            c[i * n + j] = alpha * sum + beta * c[i * n + j];
+        }
+    }
+#else
+    gemm_seq(m, n, k, alpha, a, b, beta, c);
+#endif
+}
+
+}  // namespace myblas
+
+template <typename T>
+bool almost_equal(T lhs, T rhs, T eps = static_cast<T>(1e-4)) {
+    const T diff = abs(lhs - rhs);
+    const T scale = max({T(1), abs(lhs), abs(rhs)});
+    return diff <= eps * scale;
+}
+
+template <typename T>
+bool vectors_close(const vector<T>& a, const vector<T>& b, T eps) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!almost_equal(a[i], b[i], eps)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+void fill_vector(vector<T>& v, T base) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        v[i] = base + static_cast<T>((i % 97) * 0.013) - static_cast<T>((i % 23) * 0.007);
     }
 }
 
-double manual_ddot(int n, const double* x, const double* y) {
-    double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += x[i] * y[i];
-    }
-    return sum;
+template <typename T>
+string type_name() {
+    return is_same_v<T, float> ? "float" : "double";
 }
 
-template <typename F>
-double measure_ms(F&& func, int repeats) {
-    using clock = chrono::steady_clock;
-    const auto start = clock::now();
-    for (int i = 0; i < repeats; ++i) {
-        func();
-    }
-    const auto finish = clock::now();
-    chrono::duration<double, milli> elapsed = finish - start;
-    return elapsed.count();
-}
-
-inline double calc_perf(double manual, double openblas) {
-    return (openblas / manual) * 100.0;
-}
-
-BenchmarkResult benchmark_saxpy(int n, int repeats) {
-    vector<float> x(n);
-    vector<float> y_base(n);
-
-    for (int i = 0; i < n; ++i) {
-        x[i] = 0.001f * (i % 100 + 1);
-        y_base[i] = 0.002f * (i % 70 + 1);
-    }
-
-    const float alpha = 1.75f;
-    volatile float guard = 0.0f;
-
-    const double manual_ms = measure_ms([&]() {
-        vector<float> y = y_base;
-        manual_saxpy(n, alpha, x.data(), y.data());
-        guard += y[n / 2];
-    }, repeats);
-
-    const double openblas_ms = measure_ms([&]() {
-        vector<float> y = y_base;
-        cblas_saxpy(n, alpha, x.data(), 1, y.data(), 1);
-        guard += y[n / 2];
-    }, repeats);
-
-    return {"saxpy(float)", manual_ms, openblas_ms,
-            calc_perf(manual_ms, openblas_ms)};
-}
-
-BenchmarkResult benchmark_dscal(int n, int repeats) {
-    vector<double> x_base(n);
-
-    for (int i = 0; i < n; ++i) {
-        x_base[i] = 0.003 * (i % 130 + 1);
-    }
-
-    const double alpha = 0.75;
-    volatile double guard = 0.0;
-
-    const double manual_ms = measure_ms([&]() {
-        vector<double> x = x_base;
-        manual_dscal(n, alpha, x.data());
-        guard += x[n / 3];
-    }, repeats);
-
-    const double openblas_ms = measure_ms([&]() {
-        vector<double> x = x_base;
-        cblas_dscal(n, alpha, x.data(), 1);
-        guard += x[n / 3];
-    }, repeats);
-
-    return {"dscal(double)", manual_ms, openblas_ms,
-            calc_perf(manual_ms, openblas_ms)};
-}
-
-BenchmarkResult benchmark_ddot(int n, int repeats) {
-    vector<double> x(n), y(n);
-
-    for (int i = 0; i < n; ++i) {
-        x[i] = 0.001 * (i % 150 + 1);
-        y[i] = 0.002 * (i % 90 + 1);
-    }
-
-    volatile double guard = 0.0;
-
-    const double manual_ms = measure_ms([&]() {
-        guard += manual_ddot(n, x.data(), y.data());
-    }, repeats);
-
-    const double openblas_ms = measure_ms([&]() {
-        guard += cblas_ddot(n, x.data(), 1, y.data(), 1);
-    }, repeats);
-
-    return {"ddot(double)", manual_ms, openblas_ms,
-            calc_perf(manual_ms, openblas_ms)};
-}
-
-void run_benchmarks() {
-    const int n = 2'000'000;
-    const int repeats = 12;
-
-    cout << '\n' << CYAN << "=== СРАВНЕНИЕ ПРОИЗВОДИТЕЛЬНОСТИ ===" << RESET << '\n';
-    cout << "OpenBLAS принят за 100%\n";
-
-    vector<BenchmarkResult> results;
-    results.push_back(benchmark_saxpy(n, repeats));
-    results.push_back(benchmark_dscal(n, repeats));
-    results.push_back(benchmark_ddot(n, repeats));
-
-    cout << '\n'
-         << left << setw(28) << "Операция"
-         << right << setw(16) << "Manual, ms"
-         << "  " << setw(16) << "OpenBLAS, ms"
-         << "  " << setw(12) << "% от OpenBLAS" << '\n';
-
-    cout << string(70, '-') << '\n';
-
-    cout << fixed << setprecision(2);
-
-    for (const auto& r : results) {
-        cout << left << setw(18) << r.name
-             << right << setw(16) << r.manual_ms
-             << "  " << setw(16) << r.openblas_ms
-             << "  " << setw(10) << r.performance_pct << "%\n";
+template <typename T>
+void openblas_gemm(int m, int n, int k, T alpha, const T* a, const T* b, T beta, T* c) {
+    if constexpr (is_same_v<T, float>) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k, alpha, a, k, b, n, beta, c, n);
+    } else {
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k, alpha, a, k, b, n, beta, c, n);
     }
 }
 
-int main(int argc, char** argv) {
-    run_benchmarks();
+double elapsed_ms(const Clock::time_point& start, const Clock::time_point& finish) {
+    return chrono::duration<double, milli>(finish - start).count();
+}
+
+double geometric_mean(const vector<double>& values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+
+    double log_sum = 0.0;
+    for (double value : values) {
+        log_sum += log(max(value, 1e-12));
+    }
+    return exp(log_sum / static_cast<double>(values.size()));
+}
+
+struct BenchRow {
+    string size_label;
+    double my_geom_ms = 0.0;
+    double openblas_geom_ms = 0.0;
+    double perf_pct = 0.0;
+};
+
+struct GemmSize {
+    int m = 0;
+    int n = 0;
+    int k = 0;
+    string label;
+};
+
+int actual_thread_count(int requested_threads) {
+#ifdef _OPENMP
+    return requested_threads;
+#else
+    (void)requested_threads;
+    return 1;
+#endif
+}
+
+void print_table_header(const string& type, const string& mode, int threads) {
+    cout << "\n=== GEMM ===\n";
+    cout << "Тип: " << type
+         << " | Режим: " << mode
+         << " | Потоки: " << threads << '\n';
+    cout << left << setw(14) << "Размер"
+         << right << setw(18) << "Моё время, мс"
+         << setw(20) << "OpenBLAS, мс"
+         << setw(20) << "% от OpenBLAS"
+         << '\n';
+    cout << string(66, '-') << '\n';
+}
+
+void print_row(const BenchRow& row) {
+    cout << left << setw(14) << row.size_label
+         << right << setw(18) << fixed << setprecision(3) << row.my_geom_ms
+         << setw(20) << row.openblas_geom_ms
+         << setw(19) << row.perf_pct << "%\n";
+}
+
+template <typename T>
+bool verify_gemm() {
+    const int m = 8;
+    const int n = 7;
+    const int k = 6;
+    const T alpha = static_cast<T>(1.1);
+    const T beta = static_cast<T>(0.9);
+
+    vector<T> a(m * k);
+    vector<T> b(k * n);
+    vector<T> c1(m * n);
+    vector<T> c2(m * n);
+
+    fill_vector(a, static_cast<T>(0.1));
+    fill_vector(b, static_cast<T>(-0.2));
+    fill_vector(c1, static_cast<T>(0.05));
+    c2 = c1;
+
+    myblas::gemm_seq<T>(m, n, k, alpha, a.data(), b.data(), beta, c1.data());
+    openblas_gemm<T>(m, n, k, alpha, a.data(), b.data(), beta, c2.data());
+
+    return vectors_close(c1, c2, static_cast<T>(2e-3));
+}
+
+bool run_checks() {
+    const bool ok_float_gemm = verify_gemm<float>();
+    const bool ok_double_gemm = verify_gemm<double>();
+
+    cout << "Проверка корректности:\n";
+    cout << "  GEMM float : " << (ok_float_gemm ? "OK" : "FAIL") << '\n';
+    cout << "  GEMM double: " << (ok_double_gemm ? "OK" : "FAIL") << '\n';
+
+    return ok_float_gemm && ok_double_gemm;
+}
+
+vector<GemmSize> gemm_sizes() {
+    return {
+        {100, 100, 100, "100x100"},
+        {316, 316, 316, "316x316"},
+        {1000, 1000, 1000, "1000x1000"},
+    };
+}
+
+vector<int> thread_counts() {
+    return {1, 2, 4, 8, 16};
+}
+
+template <typename T, typename GemmFunc>
+BenchRow benchmark_gemm_case(const GemmSize& size, GemmFunc&& my_gemm) {
+    const T alpha = static_cast<T>(1.1);
+    const T beta = static_cast<T>(0.9);
+
+    vector<T> a(static_cast<size_t>(size.m) * size.k);
+    vector<T> b(static_cast<size_t>(size.k) * size.n);
+    vector<T> c0(static_cast<size_t>(size.m) * size.n);
+    vector<T> c(static_cast<size_t>(size.m) * size.n);
+
+    fill_vector(a, static_cast<T>(0.11));
+    fill_vector(b, static_cast<T>(-0.08));
+    fill_vector(c0, static_cast<T>(0.03));
+
+    auto prepare = [&]() {
+        memcpy(c.data(), c0.data(), c0.size() * sizeof(T));
+    };
+
+    prepare();
+    my_gemm(size.m, size.n, size.k, alpha, a.data(), b.data(), beta, c.data());
+    prepare();
+    openblas_gemm<T>(size.m, size.n, size.k, alpha, a.data(), b.data(), beta, c.data());
+
+    vector<double> my_times;
+    vector<double> blas_times;
+    my_times.reserve(10);
+    blas_times.reserve(10);
+
+    volatile T guard = T(0);
+
+    for (int iter = 0; iter < 10; ++iter) {
+        prepare();
+        const auto start_my = Clock::now();
+        my_gemm(size.m, size.n, size.k, alpha, a.data(), b.data(), beta, c.data());
+        const auto finish_my = Clock::now();
+        guard += c[c.size() / 2];
+        my_times.push_back(elapsed_ms(start_my, finish_my));
+
+        prepare();
+        const auto start_blas = Clock::now();
+        openblas_gemm<T>(size.m, size.n, size.k, alpha, a.data(), b.data(), beta, c.data());
+        const auto finish_blas = Clock::now();
+        guard += c[c.size() / 2];
+        blas_times.push_back(elapsed_ms(start_blas, finish_blas));
+    }
+
+    const double my_geom = geometric_mean(my_times);
+    const double blas_geom = geometric_mean(blas_times);
+
+    BenchRow row;
+    row.size_label = size.label;
+    row.my_geom_ms = my_geom;
+    row.openblas_geom_ms = blas_geom;
+    row.perf_pct = (blas_geom > 0.0) ? (blas_geom / my_geom) * 100.0 : 0.0;
+    return row;
+}
+
+template <typename T>
+void run_gemm_group(int requested_threads) {
+    const bool parallel_mode = requested_threads > 1;
+    const string mode = parallel_mode ? "параллельный" : "последовательный";
+    const int threads = actual_thread_count(requested_threads);
+
+#ifdef _OPENMP
+    omp_set_num_threads(requested_threads);
+#endif
+
+    vector<BenchRow> rows;
+
+    for (const GemmSize& size : gemm_sizes()) {
+        rows.push_back(benchmark_gemm_case<T>(
+            size,
+            [parallel_mode](int m, int n, int k, T alpha, const T* a, const T* b, T beta, T* c) {
+                if (parallel_mode) {
+                    myblas::gemm_par<T>(m, n, k, alpha, a, b, beta, c);
+                } else {
+                    myblas::gemm_seq<T>(m, n, k, alpha, a, b, beta, c);
+                }
+            }));
+    }
+
+    print_table_header(type_name<T>(), mode, threads);
+    for (const auto& row : rows) {
+        print_row(row);
+    }
+}
+
+int main() {
+    cout << "Сравнение GEMM с OpenBLAS\n";
+#ifdef _OPENMP
+    cout << "Максимум потоков OpenMP: " << omp_get_max_threads() << '\n';
+#else
+    cout << "OpenMP не включён, параллельный режим работает как последовательный\n";
+#endif
+
+    if (!run_checks()) {
+        cerr << "Ошибка: проверка корректности не прошла.\n";
+        return 1;
+    }
+
+    for (int threads : thread_counts()) {
+        run_gemm_group<float>(threads);
+    }
+
+    for (int threads : thread_counts()) {
+        run_gemm_group<double>(threads);
+    }
+
     return 0;
 }

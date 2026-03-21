@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/test_blas.dir/test_blas.cpp.o -o test_blas  -Wl,-rpath,/usr/lib/x86_64-linux-gnu/openblas-pthread /usr/lib/x86_64-linux-gnu/openblas-pthread//libopenblas.so /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 
